@@ -1,0 +1,93 @@
+{**
+* NOTICE OF LICENSE
+*
+* This source file is subject to the Open Software License version 3.0
+* that is bundled with this package in the file LICENSE.md
+* It is also available through the world-wide-web at this URL:
+* https://opensource.org/license/osl-3-0-php
+* If you did not receive a copy of the license and are unable to
+* obtain it through the world-wide-web, please send an email
+* to support@qloapps.com so we can send you a copy immediately.
+*
+* DISCLAIMER
+*
+* Do not edit or add to this file if you wish to upgrade this module to a newer
+* versions in the future. If you wish to customize this module for your needs
+* please refer to https://store.webkul.com/customisation-guidelines for more information.
+*
+* @author Webkul IN
+* @copyright Since 2010 Webkul
+* @license https://opensource.org/license/osl-3-0-php Open Software License version 3.0
+*}
+
+{block name='order_extra_services'}
+    <div class="card">
+        <div class="card-header">
+            {l s='Extra Services'}
+        </div>
+        <div class="card-body">
+            {if (isset($additionalServices) && $additionalServices)}
+                {block name='order_extra_services_tabs'}
+                    <ul class="nav nav-tabs">
+                        <li class="active"><a href="#room_type_service_product_desc" data-toggle="tab">{l s='Services'}</a></li>
+                    </ul>
+                {/block}
+                {block name='order_extra_services_tabs_content'}
+                    <div class="tab-content">
+                        {block name='order_extra_services_tab_content'}
+                            {if isset($additionalServices) && $additionalServices}
+                                <div id="room_type_service_product_desc" class="tab-pane {if isset($additionalServices) && $additionalServices}active{/if}">
+                                    {assign var=roomCount value=1}
+                                    {foreach $additionalServices as $key => $roomAdditionalService}
+                                        <div class="room_additional_services">
+                                            <div class="additional_service_header">
+                                                {$room_type_info['selling_object_name']} {$roomCount|string_format:'%02d'}&nbsp;
+                                                <span>({if {$roomAdditionalService['adults']} <= 9}0{$roomAdditionalService['adults']}{else}{$roomAdditionalService['adults']}{/if} {if $roomAdditionalService['adults'] > 1}{l s='Adults'}{else}{l s='Adult'}{/if}{if $roomAdditionalService['children'] > 0}, {if {$roomAdditionalService['children']} <= 9}0{$roomAdditionalService['children']}{else}{$roomAdditionalService['children']}{/if} {if $roomAdditionalService['children'] > 1}{l s='Children'}{else}{l s='Child'}{/if}{/if})</span>
+                                            </div>
+                                            <div class="room_service_detail">
+                                                {foreach $roomAdditionalService['additional_services'] as $additionalService}
+                                                    <div class="room_service_block">
+                                                        <div class="">
+                                                            <div class="">
+                                                                {$additionalService['name']|escape:'html':'UTF-8'}
+                                                                {if $additionalService['allow_multiple_quantity']}
+                                                                    <span class="quantity">{l s='(Quantity: %s)' sprintf=[$additionalService['quantity']|string_format:'%02d']}</span>
+                                                                {/if}
+                                                                {assign var='priceCalcMethod' value=$additionalService.price_calculation_method|default:0}
+                                                                {capture name='htl_pcm_tooltip'}
+                                                                <div class="htl-tooltip-cont">
+                                                                    <p class="htl-tooltip-title">{l s='Applied on:'}</p>
+                                                                    <ul>
+                                                                        {foreach from=Product::getPriceCalculationMethodDaysLabel($priceCalcMethod) item='pcmDayLabel'}
+                                                                            <li>{$pcmDayLabel}</li>
+                                                                        {/foreach}
+                                                                    </ul>
+                                                                </div>
+                                                                {/capture}
+                                                                {include file='_partials/htl-tooltip.tpl' tooltip_content=$smarty.capture.htl_pcm_tooltip allow_html=true}
+                                                            </div>
+                                                        </div>
+                                                        <div class="">
+                                                            <span>
+                                                                {if $useTax}
+                                                                    {displayPrice price=$additionalService['total_price_tax_incl']|escape:'html':'UTF-8' currency=$objOrder->id_currency}
+                                                                {else}
+                                                                    {displayPrice price=$additionalService['total_price_tax_excl']|escape:'html':'UTF-8' currency=$objOrder->id_currency}
+                                                                {/if}
+                                                            </span>
+                                                        </div>
+                                                    </div>
+                                                {/foreach}
+                                            </div>
+                                        </div>
+                                        {assign var=roomCount value=$roomCount+1}
+                                    {/foreach}
+                                </div>
+                            {/if}
+                        {/block}
+                    </div>
+                {/block}
+            {/if}
+        </div>
+    </div>
+{/block}

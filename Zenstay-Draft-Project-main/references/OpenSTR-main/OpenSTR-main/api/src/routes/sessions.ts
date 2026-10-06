@@ -1,0 +1,565 @@
+import { Router, Response } from 'express';
+import { pool } from '../db/pool';
+import { requireAuth, requireRole, requirePropertyAccess, type AuthRequest } from '../middleware/auth';
+
+const router = Router();
+router.use(requireAuth);
+
+type SessionStatus = 'pending' | 'accepted' | 'in_progress' | 'submitted' | 'approved' | 'rejected';
+
+const VALID_TRANSITIONS: Record<SessionStatus, SessionStatus[]> = {
+  pending: ['accepted', 'in_progress'],
+  accepted: ['in_progress'],
+  in_progress: ['submitted'],
+  submitted: ['approved', 'rejected'],
+  approved: [],
+  rejected: ['in_progress'],
+};
+
+// GET /sessions — list sessions for property
+router.get('/', async (req: AuthRequest, res: Response): Promise<void> => {
+  const { property_id, status } = req.query;
+  const conditions: string[] = [];
+  const values: unknown[] = [];
+  let idx = 1;
+
+  if (property_id) {
+    conditions.push(`s.property_id = $${idx++}`);
+    values.push(property_id);
+  }
+  if (status) {
+    conditions.push(`s.status = $${idx++}`);
+    values.push(status);
+  }
+  // Cleaners only see their own sessions
+  if (req.user!.role === 'cleaner') {
+    conditions.push(`s.cleaner_id = $${idx++}`);
+    values.push(req.user!.userId);
+  }
+
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const result = await pool.query(
+    `SELECT s.*, u.name as cleaner_name, p.name as property_name
+     FROM clean_sessions s
+     LEFT JOIN users u ON u.id = s.cleaner_id
+     LEFT JOIN properties p ON p.id = s.property_id
+     ${where}
+     ORDER BY s.created_at DESC LIMIT 50`,
+    values
+  );
+  res.json(result.rows);
+});
+
+// GET /sessions/notes/recent — recent cleaner notes across all sessions for a property
+// NOTE: Must be registered BEFORE /:sessionId to avoid Express matching "notes" as a sessionId
+router.get('/notes/recent', async (req: AuthRequest, res: Response): Promise<void> => {
+  const { property_id, limit } = req.query;
+  const maxNotes = Math.min(parseInt(limit as string) || 10, 50);
+  const conditions: string[] = [];
+  const values: unknown[] = [maxNotes];
+  if (property_id) {
+    conditions.push('cs.property_id = $2');
+    values.push(property_id);
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const result = await pool.query(
+    `SELECT cn.*, u.name as author_name, cs.property_id,
+            r.checkin_date, r.checkout_date, r.guest_name, r.summary as reservation_summary
+     FROM cleaner_notes cn
+     JOIN users u ON u.id = cn.user_id
+     JOIN clean_sessions cs ON cs.id = cn.session_id
+     LEFT JOIN reservations r ON r.id = cs.reservation_id
+     ${where}
+     ORDER BY cn.created_at DESC
+     LIMIT $1`,
+    values
+  );
+  res.json(result.rows);
+});
+
+// DELETE /sessions/notes/:noteId — delete a cleaner note
+// NOTE: Must be registered BEFORE /:sessionId routes
+router.delete('/notes/:noteId', requireRole('owner', 'admin'), async (req: AuthRequest, res: Response): Promise<void> => {
+  const result = await pool.query(`DELETE FROM cleaner_notes WHERE id = $1 RETURNING id`, [req.params.noteId]);
+  if (!result.rows[0]) { res.status(404).json({ error: 'Not Found' }); return; }
+  res.json({ message: 'Note deleted' });
+});
+
+// GET /sessions/upcoming-cleans — upcoming cleaning days from reservation checkout dates
+// NOTE: Must be registered BEFORE /:sessionId to avoid Express matching "upcoming-cleans" as a sessionId
+router.get('/upcoming-cleans', async (req: AuthRequest, res: Response): Promise<void> => {
+  const { property_id } = req.query;
+  const conditions = [
+    `r.is_blocked = false`,
+    `(r.checkout_date >= CURRENT_DATE OR cs.status = 'rejected')`,
+  ];
+  const values: unknown[] = [];
+  let idx = 1;
+
+  if (property_id) {
+    conditions.push(`r.property_id = $${idx++}`);
+    values.push(property_id);
+  }
+
+  // Cleaners only see their assigned properties
+  if (req.user!.role === 'cleaner') {
+    conditions.push(`r.property_id IN (SELECT property_id FROM property_cleaners WHERE user_id = $${idx++} AND is_active = true)`);
+    values.push(req.user!.userId);
+  }
+
+  const where = `WHERE ${conditions.join(' AND ')}`;
+  const result = await pool.query(
+    `SELECT r.id as reservation_id, r.checkin_date, r.checkout_date, r.guest_name, r.summary, r.num_guests,
+            p.id as property_id, p.name as property_name,
+            cs.id as session_id, cs.status as session_status, cs.cleaner_id, cs.session_type, cs.scheduled_date,
+            cs.rejection_reason,
+            u.name as cleaner_name
+     FROM reservations r
+     JOIN properties p ON p.id = r.property_id
+     LEFT JOIN clean_sessions cs ON cs.reservation_id = r.id
+     LEFT JOIN users u ON u.id = cs.cleaner_id
+     ${where}
+     ORDER BY r.checkout_date ASC
+     LIMIT 30`,
+    values
+  );
+  res.json(result.rows);
+});
+
+// GET /sessions/room-cleans/:roomCleanId/tasks — task completions for a room clean
+// NOTE: Must be registered BEFORE /:sessionId to avoid Express matching "room-cleans" as a sessionId
+router.get('/room-cleans/:roomCleanId/tasks', async (req: AuthRequest, res: Response): Promise<void> => {
+  const result = await pool.query(
+    `SELECT tc.id, tc.task_id, t.label, tc.completed, tc.notes, tc.quantity_value, tc.supply_replenished
+     FROM task_completions tc
+     JOIN tasks t ON t.id = tc.task_id
+     WHERE tc.room_clean_id = $1
+     ORDER BY t.display_order`,
+    [req.params.roomCleanId]
+  );
+  res.json(result.rows);
+});
+
+// POST /sessions/:sessionId/accept — cleaner accepts a pending session
+router.post('/:sessionId/accept', async (req: AuthRequest, res: Response): Promise<void> => {
+  const current = await pool.query(`SELECT status, cleaner_id FROM clean_sessions WHERE id = $1`, [req.params.sessionId]);
+  if (!current.rows[0]) { res.status(404).json({ error: 'Not Found' }); return; }
+  if (current.rows[0].status !== 'pending') {
+    res.status(422).json({ error: 'Session is not pending' });
+    return;
+  }
+  if (req.user!.role === 'cleaner' && current.rows[0].cleaner_id !== req.user!.userId) {
+    res.status(403).json({ error: 'Forbidden' });
+    return;
+  }
+  const result = await pool.query(
+    `UPDATE clean_sessions SET status = 'accepted', updated_at = now() WHERE id = $1 RETURNING *`,
+    [req.params.sessionId]
+  );
+  res.json(result.rows[0]);
+});
+
+// POST /sessions/:sessionId/request-backup — cleaner requests backup for a session
+router.post('/:sessionId/request-backup', async (req: AuthRequest, res: Response): Promise<void> => {
+  const { reason } = req.body as { reason?: string };
+  const current = await pool.query(
+    `SELECT s.status, s.cleaner_id, s.property_id, p.name as property_name
+     FROM clean_sessions s
+     JOIN properties p ON p.id = s.property_id
+     WHERE s.id = $1`,
+    [req.params.sessionId]
+  );
+  if (!current.rows[0]) { res.status(404).json({ error: 'Not Found' }); return; }
+  if (req.user!.role === 'cleaner' && current.rows[0].cleaner_id !== req.user!.userId) {
+    res.status(403).json({ error: 'Forbidden' });
+    return;
+  }
+  // Create an issue to notify admin
+  await pool.query(
+    `INSERT INTO issues (session_id, property_id, reported_by, category, description, severity)
+     VALUES ($1, $2, $3, 'backup_request', $4, 'medium')`,
+    [req.params.sessionId, current.rows[0].property_id, req.user!.userId,
+     reason || `Backup requested for ${current.rows[0].property_name}`]
+  );
+  await pool.query(
+    `UPDATE clean_sessions SET notes = COALESCE(notes, '') || E'\n[Backup Requested] ' || $2, updated_at = now() WHERE id = $1`,
+    [req.params.sessionId, reason || 'Cleaner requested backup']
+  );
+  res.json({ message: 'Backup request submitted' });
+});
+
+// GET /sessions/:sessionId/detail — full session breakdown with rooms, tasks, photos, notes, rating
+// NOTE: Must be registered BEFORE /:sessionId to avoid Express matching "detail" as a sessionId
+router.get('/:sessionId/detail', async (req: AuthRequest, res: Response): Promise<void> => {
+  const session = await pool.query(
+    `SELECT s.*, u.name as cleaner_name, p.name as property_name
+     FROM clean_sessions s
+     LEFT JOIN users u ON u.id = s.cleaner_id
+     LEFT JOIN properties p ON p.id = s.property_id
+     WHERE s.id = $1`,
+    [req.params.sessionId]
+  );
+  if (!session.rows[0]) { res.status(404).json({ error: 'Not Found' }); return; }
+
+  const roomCleans = await pool.query(
+    `SELECT rc.*, r.display_name, r.slug, r.theme_name, r.display_order
+     FROM room_cleans rc
+     JOIN rooms r ON r.id = rc.room_id
+     WHERE rc.session_id = $1
+     ORDER BY r.display_order`,
+    [req.params.sessionId]
+  );
+
+  const roomCleanIds = roomCleans.rows.map((r: { id: string }) => r.id);
+
+  let photos: { rows: Array<Record<string, unknown>> } = { rows: [] };
+  let taskCompletions: { rows: Array<Record<string, unknown>> } = { rows: [] };
+  if (roomCleanIds.length > 0) {
+    const placeholders = roomCleanIds.map((_: string, i: number) => `$${i + 1}`).join(',');
+
+    photos = await pool.query(
+      `SELECT p.* FROM photos p WHERE p.room_clean_id IN (${placeholders}) ORDER BY p.uploaded_at`,
+      roomCleanIds
+    );
+
+    taskCompletions = await pool.query(
+      `SELECT tc.*, t.label, t.is_mandatory as is_required, t.category, t.is_high_touch, t.display_order as task_order
+       FROM task_completions tc
+       JOIN tasks t ON t.id = tc.task_id
+       WHERE tc.room_clean_id IN (${placeholders})
+       ORDER BY t.display_order`,
+      roomCleanIds
+    );
+  }
+
+  const notes = await pool.query(
+    `SELECT cn.*, u.name as author_name
+     FROM cleaner_notes cn
+     JOIN users u ON u.id = cn.user_id
+     WHERE cn.session_id = $1
+     ORDER BY cn.created_at ASC`,
+    [req.params.sessionId]
+  );
+
+  const rating = await pool.query(
+    `SELECT * FROM guest_ratings WHERE session_id = $1`,
+    [req.params.sessionId]
+  );
+
+  // Group photos and tasks by room_clean_id
+  const photosByRoom: Record<string, unknown[]> = {};
+  for (const p of photos.rows) { const rid = p.room_clean_id as string; (photosByRoom[rid] ??= []).push(p); }
+  const tasksByRoom: Record<string, unknown[]> = {};
+  for (const t of taskCompletions.rows) { const rid = t.room_clean_id as string; (tasksByRoom[rid] ??= []).push(t); }
+
+  const rooms = roomCleans.rows.map((rc: Record<string, unknown>) => ({
+    ...rc,
+    photos: photosByRoom[rc.id as string] ?? [],
+    tasks: tasksByRoom[rc.id as string] ?? [],
+  }));
+
+  res.json({
+    ...session.rows[0],
+    rooms,
+    notes: notes.rows,
+    rating: rating.rows[0] ?? null,
+  });
+});
+
+// GET /sessions/:sessionId
+router.get('/:sessionId', async (req: AuthRequest, res: Response): Promise<void> => {
+  const result = await pool.query(
+    `SELECT s.*, u.name as cleaner_name, p.name as property_name
+     FROM clean_sessions s
+     LEFT JOIN users u ON u.id = s.cleaner_id
+     LEFT JOIN properties p ON p.id = s.property_id
+     WHERE s.id = $1`,
+    [req.params.sessionId]
+  );
+  if (!result.rows[0]) { res.status(404).json({ error: 'Not Found' }); return; }
+  res.json(result.rows[0]);
+});
+
+// POST /sessions/claim — cleaner claims an unassigned clean (creates session + accepts it)
+router.post('/claim', async (req: AuthRequest, res: Response): Promise<void> => {
+  const { property_id, reservation_id, scheduled_date } = req.body;
+  if (!property_id || !reservation_id) {
+    res.status(400).json({ error: 'property_id and reservation_id required' });
+    return;
+  }
+
+  const cleanerId = req.user!.userId;
+
+  // Verify cleaner is assigned to this property
+  const access = await pool.query(
+    `SELECT 1 FROM property_cleaners WHERE property_id = $1 AND user_id = $2 AND is_active = true`,
+    [property_id, cleanerId]
+  );
+  if (!access.rows[0] && req.user!.role === 'cleaner') {
+    res.status(403).json({ error: 'Not assigned to this property' });
+    return;
+  }
+
+  // Check no session already exists for this reservation
+  const existing = await pool.query(
+    `SELECT id FROM clean_sessions WHERE reservation_id = $1`,
+    [reservation_id]
+  );
+  if (existing.rows[0]) {
+    res.status(409).json({ error: 'A session already exists for this reservation' });
+    return;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const sessionResult = await client.query(
+      `INSERT INTO clean_sessions (property_id, cleaner_id, session_type, triggered_by, reservation_id, scheduled_date, status)
+       VALUES ($1, $2, 'turnover', 'cleaner_claim', $3, $4, 'accepted') RETURNING *`,
+      [property_id, cleanerId, reservation_id, scheduled_date ?? null]
+    );
+    const session = sessionResult.rows[0];
+
+    // Auto-create room_cleans for each room in the property
+    await client.query(
+      `INSERT INTO room_cleans (session_id, room_id, status)
+       SELECT $1, id, 'pending' FROM rooms WHERE property_id = $2 AND archived = false`,
+      [session.id, property_id]
+    );
+
+    await client.query('COMMIT');
+    res.status(201).json(session);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+});
+
+// POST /sessions — create session (owner/admin)
+router.post('/', requireRole('owner', 'admin'), async (req: AuthRequest, res: Response): Promise<void> => {
+  const { property_id, cleaner_id, session_type, triggered_by, reservation_id, scheduled_date } = req.body;
+  if (!property_id) { res.status(400).json({ error: 'property_id required' }); return; }
+
+  // Auto-assign default (primary) cleaner if none specified
+  let assignedCleanerId = cleaner_id ?? null;
+  if (!assignedCleanerId) {
+    const primary = await pool.query(
+      `SELECT user_id FROM property_cleaners WHERE property_id = $1 AND is_active = true ORDER BY is_primary DESC, priority ASC LIMIT 1`,
+      [property_id]
+    );
+    if (primary.rows[0]) assignedCleanerId = primary.rows[0].user_id;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const sessionResult = await client.query(
+      `INSERT INTO clean_sessions (property_id, cleaner_id, session_type, triggered_by, reservation_id, scheduled_date)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [property_id, assignedCleanerId, session_type ?? 'turnover', triggered_by ?? 'manual', reservation_id ?? null, scheduled_date ?? null]
+    );
+    const session = sessionResult.rows[0];
+
+    // Auto-create room_cleans for each room in the property
+    await client.query(
+      `INSERT INTO room_cleans (session_id, room_id, status)
+       SELECT $1, id, 'pending' FROM rooms WHERE property_id = $2 AND archived = false`,
+      [session.id, property_id]
+    );
+
+    await client.query('COMMIT');
+    res.status(201).json(session);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+});
+
+// PATCH /sessions/:sessionId/status — state machine transition
+router.patch('/:sessionId/status', async (req: AuthRequest, res: Response): Promise<void> => {
+  const { status, rejection_reason } = req.body as { status?: string; rejection_reason?: string };
+  if (!status) { res.status(400).json({ error: 'status required' }); return; }
+
+  const current = await pool.query(`SELECT status, cleaner_id FROM clean_sessions WHERE id = $1`, [req.params.sessionId]);
+  if (!current.rows[0]) { res.status(404).json({ error: 'Not Found' }); return; }
+
+  const currentStatus = current.rows[0].status as SessionStatus;
+  const allowed = VALID_TRANSITIONS[currentStatus] ?? [];
+  if (!allowed.includes(status as SessionStatus)) {
+    res.status(422).json({ error: `Cannot transition from ${currentStatus} to ${status}` });
+    return;
+  }
+
+  // Cleaners can only update their own session
+  if (req.user!.role === 'cleaner' && current.rows[0].cleaner_id !== req.user!.userId) {
+    res.status(403).json({ error: 'Forbidden' });
+    return;
+  }
+
+  const extraFields: Record<string, unknown> = {};
+  if (status === 'in_progress') extraFields.cleaner_start_time = new Date().toISOString();
+  if (status === 'submitted') extraFields.cleaner_end_time = new Date().toISOString();
+  if (status === 'submitted') extraFields.submitted_at = new Date().toISOString();
+  if (status === 'approved' || status === 'rejected') {
+    extraFields.reviewed_at = new Date().toISOString();
+    extraFields.reviewed_by = req.user!.userId;
+  }
+  if (status === 'rejected' && rejection_reason) extraFields.rejection_reason = rejection_reason;
+  if (status === 'rejected' && !rejection_reason?.trim()) {
+    res.status(400).json({ error: 'rejection_reason is required when rejecting a session' });
+    return;
+  }
+
+  const setClauses = Object.keys(extraFields).map((k, i) => `${k} = $${i + 3}`);
+  const result = await pool.query(
+    `UPDATE clean_sessions SET status = $1, updated_at = now()${setClauses.length ? ', ' + setClauses.join(', ') : ''}
+     WHERE id = $2 RETURNING *`,
+    [status, req.params.sessionId, ...Object.values(extraFields)]
+  );
+  res.json(result.rows[0]);
+});
+
+// POST /sessions/schedule — manual scheduling for residences (issue #31)
+router.post('/schedule', requireRole('owner', 'admin'), async (req: AuthRequest, res: Response): Promise<void> => {
+  const { property_id, cleaner_id, scheduled_date, session_type, photo_required, recurrence, notes } = req.body;
+  if (!property_id || !scheduled_date) {
+    res.status(400).json({ error: 'property_id and scheduled_date required' });
+    return;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const sessionResult = await client.query(
+      `INSERT INTO clean_sessions (property_id, cleaner_id, session_type, triggered_by,
+        scheduled_date, photo_required, recurrence, notes)
+       VALUES ($1, $2, $3, 'manual', $4, $5, $6, $7) RETURNING *`,
+      [property_id, cleaner_id ?? null, session_type ?? 'scheduled',
+       scheduled_date, photo_required ?? true, recurrence ?? null, notes ?? null]
+    );
+    const session = sessionResult.rows[0];
+
+    // Auto-create room_cleans
+    await client.query(
+      `INSERT INTO room_cleans (session_id, room_id, status)
+       SELECT $1, id, 'pending' FROM rooms WHERE property_id = $2 AND archived = false`,
+      [session.id, property_id]
+    );
+
+    await client.query('COMMIT');
+    res.status(201).json(session);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+});
+
+// POST /sessions/:sessionId/rating
+router.post('/:sessionId/rating', async (req: AuthRequest, res: Response): Promise<void> => {
+  const { rating, review_text } = req.body as { rating?: number; review_text?: string };
+  if (!rating || rating < 1 || rating > 5) {
+    res.status(400).json({ error: 'rating must be 1–5' });
+    return;
+  }
+  const result = await pool.query(
+    `INSERT INTO guest_ratings (session_id, rating, review_text)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (session_id) DO UPDATE SET rating = $2, review_text = $3
+     RETURNING *`,
+    [req.params.sessionId, rating, review_text ?? null]
+  );
+  res.status(201).json(result.rows[0]);
+});
+
+// DELETE /sessions/:sessionId — delete a session and its related data (owner/admin only)
+router.delete('/:sessionId', requireRole('owner', 'admin'), async (req: AuthRequest, res: Response): Promise<void> => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Delete child data first
+    await client.query(
+      `DELETE FROM task_completions WHERE room_clean_id IN (SELECT id FROM room_cleans WHERE session_id = $1)`,
+      [req.params.sessionId]
+    );
+    await client.query(
+      `DELETE FROM photos WHERE room_clean_id IN (SELECT id FROM room_cleans WHERE session_id = $1)`,
+      [req.params.sessionId]
+    );
+    await client.query(`DELETE FROM room_cleans WHERE session_id = $1`, [req.params.sessionId]);
+    await client.query(`DELETE FROM guest_ratings WHERE session_id = $1`, [req.params.sessionId]);
+    await client.query(`DELETE FROM issues WHERE session_id = $1`, [req.params.sessionId]);
+    const result = await client.query(`DELETE FROM clean_sessions WHERE id = $1 RETURNING id`, [req.params.sessionId]);
+    await client.query('COMMIT');
+    if (!result.rows[0]) { res.status(404).json({ error: 'Not Found' }); return; }
+    res.json({ message: 'Session deleted' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+});
+
+// GET /sessions/:sessionId/rooms — room cleans with task completions
+router.get('/:sessionId/rooms', async (req: AuthRequest, res: Response): Promise<void> => {
+  const rooms = await pool.query(
+    `SELECT rc.*, r.display_name, r.slug, r.theme_name, r.display_order
+     FROM room_cleans rc
+     JOIN rooms r ON r.id = rc.room_id
+     WHERE rc.session_id = $1
+     ORDER BY r.display_order`,
+    [req.params.sessionId]
+  );
+  res.json(rooms.rows);
+});
+
+// GET /sessions/:sessionId/notes — cleaner notes for a session
+router.get('/:sessionId/notes', async (req: AuthRequest, res: Response): Promise<void> => {
+  const result = await pool.query(
+    `SELECT cn.*, u.name as author_name
+     FROM cleaner_notes cn
+     JOIN users u ON u.id = cn.user_id
+     WHERE cn.session_id = $1
+     ORDER BY cn.created_at DESC`,
+    [req.params.sessionId]
+  );
+  res.json(result.rows);
+});
+
+// POST /sessions/:sessionId/notes — add a cleaner note
+router.post('/:sessionId/notes', async (req: AuthRequest, res: Response): Promise<void> => {
+  const { note } = req.body as { note?: string };
+  if (!note?.trim()) { res.status(400).json({ error: 'note is required' }); return; }
+  const result = await pool.query(
+    `INSERT INTO cleaner_notes (session_id, user_id, note) VALUES ($1, $2, $3) RETURNING *`,
+    [req.params.sessionId, req.user!.userId, note.trim()]
+  );
+  res.status(201).json(result.rows[0]);
+});
+
+// PATCH /sessions/:sessionId/room-cleans/:roomCleanId — update room clean status (admin revert)
+router.patch('/:sessionId/room-cleans/:roomCleanId', requireRole('owner', 'admin'), async (req: AuthRequest, res: Response): Promise<void> => {
+  const { status } = req.body as { status?: string };
+  const validStatuses = ['pending', 'in_progress', 'completed', 'skipped'];
+  if (!status || !validStatuses.includes(status)) {
+    res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
+    return;
+  }
+  const result = await pool.query(
+    `UPDATE room_cleans SET status = $1, updated_at = now() WHERE id = $2 AND session_id = $3 RETURNING *`,
+    [status, req.params.roomCleanId, req.params.sessionId]
+  );
+  if (!result.rows[0]) { res.status(404).json({ error: 'Room clean not found' }); return; }
+  res.json(result.rows[0]);
+});
+
+export default router;
